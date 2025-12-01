@@ -1,169 +1,172 @@
 import os
 import numpy as np
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-from PIL import Image
-from tqdm import tqdm
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from PIL import Image
+from tqdm import tqdm
+import pennylane as qml
 
 
+DATA_PATH = "data/train/images/"
+MASK_PATH = "data/train/masks/"
+IMG_SIZE = 64
+BATCH_SIZE = 6
+EPOCHS = 12
+LR = 0.0005
 
-def load_dataset(base_path="train", size=(64, 64), limit=400):
-    images, masks = [], []
-    img_dir = os.path.join(base_path, "images")
-    mask_dir = os.path.join(base_path, "masks")
-    img_files = os.listdir(img_dir)[:limit]
+def load_image(path):
+    img = Image.open(path).convert("L")
+    img = img.resize((IMG_SIZE, IMG_SIZE))
+    img = np.array(img) / 255.0
+    return img.astype(np.float32)
 
-    for fname in tqdm(img_files, desc="Loading dataset"):
-        img = np.array(Image.open(os.path.join(img_dir, fname))
-                       .convert("L").resize(size)) / 255.0
+class TGSDataset(Dataset):
+    def __init__(self, files):
+        self.files = files
 
-        mask = np.array(Image.open(os.path.join(mask_dir, fname))
-                        .convert("L").resize(size)) / 255.0
+    def __len__(self):
+        return len(self.files)
 
-        if mask.sum() > 0:
-            images.append(img)
-            masks.append(mask)
+    def __getitem__(self, idx):
+        name = self.files[idx]
+        image = load_image(os.path.join(DATA_PATH, name))
+        mask  = load_image(os.path.join(MASK_PATH, name))
+        mask = (mask > 0.5).astype(np.float32)
+        return torch.tensor(image).unsqueeze(0), torch.tensor(mask).unsqueeze(0)
 
-    print(f"Loaded {len(images)} valid samples of size {images[0].shape}")
-    return np.array(images), np.array(masks)
+files = [f for f in os.listdir(DATA_PATH) if f.endswith(".png")]
+train_files, val_files = train_test_split(files, test_size=0.15, random_state=42)
+train_loader = DataLoader(TGSDataset(train_files), batch_size=BATCH_SIZE, shuffle=True)
+val_loader   = DataLoader(TGSDataset(val_files),   batch_size=BATCH_SIZE)
 
+n_qubits = 8
+dev = qml.device("default.qubit", wires=n_qubits)
 
+@qml.qnode(dev, interface="torch")
+def q_block(inputs, weights):
+    # normalize inputs to [-pi, pi]
+    scaled = (inputs - torch.mean(inputs)) / (torch.std(inputs) + 1e-6)
+    scaled = scaled * np.pi
 
-class DoubleConv(nn.Module):
-    """Conv → ReLU → Conv → ReLU"""
-    def __init__(self, in_c, out_c):
+    for i in range(n_qubits):
+        qml.RY(scaled[i], wires=i)
+
+    qml.templates.layers.BasicEntanglerLayers(weights, wires=range(n_qubits))
+    return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
+
+class QuantumLayer(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_c, out_c, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(out_c, out_c, 3, padding=1),
-            nn.ReLU()
-        )
+        self.weights = nn.Parameter(torch.randn(1, n_qubits) * 0.15)
 
     def forward(self, x):
-        return self.conv(x)
+        outputs = []
+        for vec in x:
+            out = q_block(vec, self.weights)
+            outputs.append(torch.stack(out).float())
+        return torch.stack(outputs)
 
 
-class UNet(nn.Module):
+class HybridQuantumCNN(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.down1 = DoubleConv(1, 16)
-        self.down2 = DoubleConv(16, 32)
-        self.down3 = DoubleConv(32, 64)
+        # stronger encoder
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Flatten()
+        )
 
-        self.pool = nn.MaxPool2d(2)
+        self.fc_enc = nn.Linear(8192, n_qubits)
 
-        self.mid = DoubleConv(64, 128)
+        # Quantum bottleneck
+        self.q_layer = QuantumLayer()
 
-        self.up3 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.conv3 = DoubleConv(128, 64)
+        # decode
+        self.fc_dec = nn.Linear(n_qubits, 8192)
 
-        self.up2 = nn.ConvTranspose2d(64, 32, 2, stride=2)
-        self.conv2 = DoubleConv(64, 32)
-
-        self.up1 = nn.ConvTranspose2d(32, 16, 2, stride=2)
-        self.conv1 = DoubleConv(32, 16)
-
-        self.output_layer = nn.Conv2d(16, 1, 1)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(32, 16, 2, stride=2), nn.ReLU(),
+            nn.ConvTranspose2d(16, 1, 2, stride=2),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        x1 = self.down1(x)
-        x2 = self.down2(self.pool(x1))
-        x3 = self.down3(self.pool(x2))
+        z = self.encoder(x)
+        z = self.fc_enc(z)
+        z = self.q_layer(z)
+        d = self.fc_dec(z).reshape(-1, 32, 16, 16)
+        return self.decoder(d)
 
-        xm = self.mid(self.pool(x3))
+def dice_coef(pred, target, eps=1e-8):
+    pred = (pred > 0.5).float()
+    inter = (pred * target).sum()
+    union = pred.sum() + target.sum()
+    return (2 * inter + eps) / (union + eps)
 
-        x = self.up3(xm)
-        x = self.conv3(torch.cat([x, x3], dim=1))
+def iou(pred, target, eps=1e-8):
+    pred = (pred > 0.5).float()
+    inter = (pred * target).sum()
+    union = pred.sum() + target.sum() - inter
+    return (inter + eps) / (union + eps)
 
-        x = self.up2(x)
-        x = self.conv2(torch.cat([x, x2], dim=1))
-
-        x = self.up1(x)
-        x = self.conv1(torch.cat([x, x1], dim=1))
-
-        return torch.sigmoid(self.output_layer(x))
-
-
-
-
-def dice_loss(pred, target, smooth=1e-5):
-    pred = pred.contiguous()
-    target = target.contiguous()
-
-    intersection = (pred * target).sum()
-    return 1 - (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
+def accuracy(pred, target):
+    pred = (pred > 0.5).float()
+    correct = (pred == target).float().sum()
+    total = torch.numel(pred)
+    return correct / total
 
 
-def bce_dice_loss(pred, target):
-    return F.binary_cross_entropy(pred, target) + dice_loss(pred, target)
+class BCEDiceLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bce = nn.BCELoss()
 
+    def forward(self, pred, target):
+        bce = self.bce(pred, target)
+        dice = 1 - dice_coef(pred, target)
+        return bce + dice
 
-# =====================================================
-#                     TRAINING LOOP
-# =====================================================
+model = HybridQuantumCNN()
+criterion = BCEDiceLoss()
+optimizer = optim.Adam(model.parameters(), lr=LR)
 
-def train_unet(model, images, masks, epochs=10, lr=0.001):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+print("\nTraining Hybrid Quantum CNN...\n")
 
-    for epoch in range(epochs):
-        losses = []
+for epoch in range(EPOCHS):
+    model.train()
+    total_loss = 0
 
-        for img, mask in zip(images, masks):
-            img_t = torch.tensor(img).unsqueeze(0).unsqueeze(0).float()   # [B,C,H,W]
-            mask_t = torch.tensor(mask).unsqueeze(0).unsqueeze(0).float()
+    print(f"Epoch {epoch+1}/{EPOCHS}")
+    train_bar = tqdm(train_loader, desc="Training", leave=False)
 
-            optimizer.zero_grad()
+    for imgs, masks in train_bar:
+        optimizer.zero_grad()
+        preds = model(imgs)
+        loss = criterion(preds, masks)
+        loss.backward()
+        optimizer.step()
 
-            preds = model(img_t)
-            loss = bce_dice_loss(preds, mask_t)
+        total_loss += loss.item()
+        train_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-            loss.backward()
-            optimizer.step()
+    model.eval()
+    dices, ious, accs = [], [], []
 
-            losses.append(loss.item())
+    with torch.no_grad():
+        for imgs, masks in val_loader:
+            preds = model(imgs)
+            dices.append(dice_coef(preds, masks).item())
+            ious.append(iou(preds, masks).item())
+            accs.append(accuracy(preds, masks).item())
 
-        print(f"Epoch {epoch+1}/{epochs} | Loss = {np.mean(losses):.4f}")
-        visualize_prediction(model, images[0], masks[0], epoch+1)
+    print(f"Loss={total_loss:.3f} | Dice={np.mean(dices):.4f} | IoU={np.mean(ious):.4f} | Acc={np.mean(accs):.4f}\n")
 
-
-def visualize_prediction(model, image, mask, epoch):
-    img_t = torch.tensor(image).unsqueeze(0).unsqueeze(0).float()
-    pred = model(img_t).detach().cpu().numpy()[0,0]
-
-    plt.figure(figsize=(9, 3))
-
-    plt.subplot(1, 3, 1)
-    plt.imshow(image, cmap="gray")
-    plt.title("Input")
-    plt.axis("off")
-
-    plt.subplot(1, 3, 2)
-    plt.imshow(mask, cmap="gray")
-    plt.title("True Mask")
-    plt.axis("off")
-
-    plt.subplot(1, 3, 3)
-    plt.imshow(pred, cmap="inferno")
-    plt.title(f"Predicted (Epoch {epoch})")
-    plt.axis("off")
-
-    plt.tight_layout()
-    plt.savefig(f"unet_pred_epoch_{epoch}.png", dpi=200)
-    plt.close()
-    print(f"Saved unet_pred_epoch_{epoch}.png")
-
-
-
-if __name__ == "__main__":
-    images, masks = load_dataset("data/train", size=(64, 64), limit=400)
-
-    model = UNet()
-    train_unet(model, images, masks, epochs=10, lr=0.001)
+print("Training complete!")

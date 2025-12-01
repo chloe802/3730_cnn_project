@@ -1,0 +1,49 @@
+1. Go to the Kaggle competition page:
+https://www.kaggle.com/c/tgs-salt-identification-challenge
+
+2. Click Download All.
+
+3. You will get a file named:
+tgs-salt-identification-challenge.zip
+
+4.Unzip it. You should now see folders like:
+train/
+test/
+train.csv
+sample_submission.csv
+
+
+5. make sure the project structure looks like this
+
+your_project/
+│
+├── data/
+│   └── tgs/
+│        ├── train/
+│        │   ├── images/
+│        │   └── masks/
+│        ├── test/
+│        └── train.csv
+│
+├── src/
+│   ├── load_data.py
+│   └── model.py
+│
+├── main.py
+└── README.md
+
+
+NOTE:
+masks/ should look like this:
+000a50a6a_mask.png
+0033a8f1a_mask.png
+...
+
+
+images/ should looks like this:
+000a50a6a.png
+0033a8f1a.png
+...
+
+
+6. run load_data.py
